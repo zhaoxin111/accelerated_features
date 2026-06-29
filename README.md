@@ -122,6 +122,11 @@ xfeat = XFeat()
 #Simple inference with batch sz = 1
 output = xfeat.detectAndCompute(torch.randn(1,3,480,640), top_k = 4096)[0]
 ```
+
+For integration from another repository, use the stable wrapper documented in
+[docs/XFEAT_API.md](docs/XFEAT_API.md). It exposes keypoint detection, pair
+matching, JSON/NPZ debug outputs, and an optional match visualization CLI.
+
 Or you can use this [script](./minimal_example.py) in the root folder:
 ```bash
 python3 minimal_example.py

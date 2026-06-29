@@ -6,7 +6,12 @@ used immediately after cloning or placing images in that folder.
 """
 
 import argparse
+import os
 from pathlib import Path
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
@@ -21,6 +26,22 @@ def parse_args():
     parser.add_argument("--output", default="outputs/pair1_xfeat_matches.jpg", help="Output visualization path.")
     parser.add_argument("--top-k", type=int, default=4096, help="Maximum number of XFeat keypoints per image.")
     parser.add_argument("--min-cossim", type=float, default=0.82, help="Minimum cosine similarity for mutual matches.")
+    parser.add_argument(
+        "--semi-dense",
+        action="store_true",
+        help="Use semi-dense XFeat* matching instead of sparse XFeat matching.",
+    )
+    parser.add_argument(
+        "--lighterglue",
+        action="store_true",
+        help="Use XFeat sparse features matched by LighterGlue.",
+    )
+    parser.add_argument(
+        "--lighterglue-min-conf",
+        type=float,
+        default=0.1,
+        help="Minimum LighterGlue match confidence.",
+    )
     parser.add_argument("--ransac-thr", type=float, default=4.0, help="RANSAC reprojection threshold in pixels.")
     parser.add_argument("--max-draw-matches", type=int, default=200, help="Maximum number of matches to draw.")
     parser.add_argument("--sample-seed", type=int, default=0, help="Random seed used when sampling drawn matches.")
@@ -34,17 +55,25 @@ def parse_args():
         help="Require abs(dy) to be at least this ratio times abs(dx).",
     )
     parser.add_argument(
-        "--upward-top-fraction",
-        type=float,
-        default=0.3,
-        help="Visualize the top fraction of upward-dominant matches by upward displacement.",
+        "--upward-top-k",
+        type=int,
+        default=30,
+        help="Visualize this many upward-dominant matches with the strongest upward displacement. Use 0 for all.",
     )
     parser.add_argument(
         "--no-ransac",
         action="store_true",
         help="Draw all descriptor matches instead of homography inliers.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_matcher_args(parser, args)
+    return args
+
+
+def validate_matcher_args(parser, args):
+    enabled_modes = int(args.semi_dense) + int(args.lighterglue)
+    if enabled_modes > 1:
+        parser.error("--semi-dense and --lighterglue are mutually exclusive")
 
 
 def read_image(path):
@@ -94,7 +123,7 @@ def select_upward_dominant_indices(
     sample_seed=0,
     upward_min_pixels=1.0,
     upward_dominance_ratio=1.0,
-    upward_top_fraction=0.3,
+    upward_top_k=30,
 ):
     """Select strongest upward-dominant matches by image1 upward displacement."""
     dx = points1[:, 0] - points0[:, 0]
@@ -106,9 +135,8 @@ def select_upward_dominant_indices(
         selected &= inlier_mask
 
     candidate_indices = np.flatnonzero(selected)
-    top_fraction = np.clip(upward_top_fraction, 0.0, 1.0)
-    if len(candidate_indices) > 0 and top_fraction > 0:
-        top_count = max(1, int(np.ceil(len(candidate_indices) * top_fraction)))
+    if len(candidate_indices) > 0:
+        top_count = len(candidate_indices) if upward_top_k <= 0 else min(upward_top_k, len(candidate_indices))
         upward_displacement = -dy[candidate_indices]
         top_order = np.argsort(-upward_displacement)[:top_count]
         top_indices = np.sort(candidate_indices[top_order])
@@ -144,6 +172,68 @@ def draw_point_panel(image, points, label, color, point_radius):
         center = (int(round(point[0])), int(round(point[1])))
         cv2.circle(panel, center, outline_radius, (0, 0, 0), -1, cv2.LINE_AA)
         cv2.circle(panel, center, point_radius, color, -1, cv2.LINE_AA)
+    put_label(panel, label, origin=(8, 22), font_scale=0.55, thickness=1)
+    return panel
+
+
+def value_colors(values):
+    """Map scalar values to BGR colors for OpenCV drawing."""
+    if len(values) == 0:
+        return np.empty((0, 3), dtype=np.uint8)
+
+    values = np.asarray(values, dtype=np.float32)
+    value_min = float(values.min())
+    value_max = float(values.max())
+    if value_max > value_min:
+        normalized = (values - value_min) / (value_max - value_min)
+    else:
+        normalized = np.full_like(values, 0.5)
+
+    color_values = np.clip(np.round(normalized * 255), 0, 255).astype(np.uint8)
+    color_map = getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
+    return cv2.applyColorMap(color_values[:, None], color_map)[:, 0, :]
+
+
+def draw_value_colorbar(panel, value_min, value_max):
+    """Draw a compact value colorbar in the upper-right corner."""
+    if panel.shape[0] < 80 or panel.shape[1] < 80:
+        return
+
+    color_map = getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
+    bar_height = min(120, max(40, panel.shape[0] // 4))
+    bar_width = 12
+    margin = 12
+    x0 = panel.shape[1] - margin - bar_width
+    y0 = margin
+
+    gradient = np.linspace(255, 0, bar_height, dtype=np.uint8)[:, None]
+    colorbar = cv2.applyColorMap(gradient, color_map)
+    panel[y0 : y0 + bar_height, x0 : x0 + bar_width] = colorbar
+    cv2.rectangle(panel, (x0, y0), (x0 + bar_width, y0 + bar_height), (0, 0, 0), 1, cv2.LINE_AA)
+
+    put_label(panel, f"{value_max:.1f}px", origin=(max(4, x0 - 58), y0 + 10), font_scale=0.35, thickness=1)
+    put_label(
+        panel,
+        f"{value_min:.1f}px",
+        origin=(max(4, x0 - 58), y0 + bar_height),
+        font_scale=0.35,
+        thickness=1,
+    )
+
+
+def draw_colored_point_panel(image, points, values, label, point_radius):
+    """Draw point locations colored by scalar value."""
+    panel = image.copy()
+    outline_radius = max(point_radius + 1, 1)
+    colors = value_colors(values)
+    for point, color in zip(points, colors):
+        center = (int(round(point[0])), int(round(point[1])))
+        cv2.circle(panel, center, outline_radius, (0, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(panel, center, point_radius, tuple(int(c) for c in color), -1, cv2.LINE_AA)
+
+    if len(values) > 0:
+        draw_value_colorbar(panel, float(np.min(values)), float(np.max(values)))
+        label += f" | up {float(np.min(values)):.1f}-{float(np.max(values)):.1f}px"
     put_label(panel, label, origin=(8, 22), font_scale=0.55, thickness=1)
     return panel
 
@@ -184,6 +274,45 @@ def draw_matches(
     return canvas
 
 
+def matcher_slug(semi_dense=False, lighterglue=False):
+    if lighterglue:
+        return "lighterglue"
+    if semi_dense:
+        return "semidense"
+    return "sparse"
+
+
+def matcher_label(semi_dense=False, lighterglue=False):
+    if lighterglue:
+        return "XFeat + LighterGlue"
+    if semi_dense:
+        return "XFeat* semi-dense"
+    return "XFeat sparse"
+
+
+def match_images(
+    matcher,
+    image0,
+    image1,
+    top_k=4096,
+    min_cossim=0.82,
+    semi_dense=False,
+    lighterglue=False,
+    lighterglue_min_conf=0.1,
+):
+    if lighterglue:
+        output0 = matcher.detectAndCompute(image0, top_k=top_k)[0]
+        output1 = matcher.detectAndCompute(image1, top_k=top_k)[0]
+        output0["image_size"] = (image0.shape[1], image0.shape[0])
+        output1["image_size"] = (image1.shape[1], image1.shape[0])
+        points0, points1, _ = matcher.match_lighterglue(output0, output1, min_conf=lighterglue_min_conf)
+        return points0, points1
+
+    if semi_dense:
+        return matcher.match_xfeat_star(image0, image1, top_k=top_k)
+    return matcher.match_xfeat(image0, image1, top_k=top_k, min_cossim=min_cossim)
+
+
 def draw_visualization(
     image0,
     image1,
@@ -194,8 +323,11 @@ def draw_visualization(
     inlier_mask=None,
     point_radius=2,
     title_scale=0.45,
+    semi_dense=False,
+    lighterglue=False,
 ):
     """Create match, sampled-point, and upward-dominant point visualizations."""
+    method_label = matcher_label(semi_dense=semi_dense, lighterglue=lighterglue)
     match_canvas = draw_matches(
         image0,
         image1,
@@ -204,6 +336,11 @@ def draw_visualization(
         selected_indices,
         inlier_mask=inlier_mask,
         title_scale=title_scale,
+        label=(
+            f"{method_label} matches: {len(points0)}"
+            + (f" | RANSAC inliers: {int(inlier_mask.sum())}" if inlier_mask is not None else "")
+            + f" | drawn: {len(selected_indices)}"
+        ),
     )
 
     point_panel0 = draw_point_panel(
@@ -227,11 +364,12 @@ def draw_visualization(
     match_canvas = pad_to_width(match_canvas, canvas_width)
     point_canvas = pad_to_width(point_canvas, canvas_width)
 
-    upward_panel = draw_point_panel(
+    upward_magnitudes = points0[upward_draw_indices, 1] - points1[upward_draw_indices, 1]
+    upward_panel = draw_colored_point_panel(
         image1,
         points1[upward_draw_indices],
+        upward_magnitudes,
         f"up pts: {len(upward_draw_indices)}",
-        (255, 255, 0),
         point_radius,
     )
     upward_canvas = pad_to_width(upward_panel, canvas_width)
@@ -261,6 +399,7 @@ def pad_to_width(image, width):
 
 def main():
     args = parse_args()
+
     image0_path = Path(args.image0)
     image1_path = Path(args.image1)
     output_path = Path(args.output)
@@ -269,7 +408,16 @@ def main():
     image1 = read_image(image1_path)
 
     matcher = XFeat(top_k=args.top_k)
-    points0, points1 = matcher.match_xfeat(image0, image1, top_k=args.top_k, min_cossim=args.min_cossim)
+    points0, points1 = match_images(
+        matcher,
+        image0,
+        image1,
+        top_k=args.top_k,
+        min_cossim=args.min_cossim,
+        semi_dense=args.semi_dense,
+        lighterglue=args.lighterglue,
+        lighterglue_min_conf=args.lighterglue_min_conf,
+    )
 
     inlier_mask = None
     if not args.no_ransac:
@@ -290,7 +438,7 @@ def main():
         sample_seed=args.sample_seed + 1,
         upward_min_pixels=args.upward_min_pixels,
         upward_dominance_ratio=args.upward_dominance_ratio,
-        upward_top_fraction=args.upward_top_fraction,
+        upward_top_k=args.upward_top_k,
     )
     canvas = draw_visualization(
         image0,
@@ -302,12 +450,15 @@ def main():
         inlier_mask=inlier_mask,
         point_radius=args.point_radius,
         title_scale=args.title_scale,
+        semi_dense=args.semi_dense,
+        lighterglue=args.lighterglue,
     )
     if not cv2.imwrite(str(output_path), canvas):
         raise RuntimeError(f"Could not write output image: {output_path}")
 
     print(f"image0: {image0_path}")
     print(f"image1: {image1_path}")
+    print(f"matcher: {matcher_label(semi_dense=args.semi_dense, lighterglue=args.lighterglue)}")
     print(f"matches: {len(points0)}")
     if inlier_mask is not None:
         print(f"ransac_inliers: {int(inlier_mask.sum())}")
